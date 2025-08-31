@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+IPX - Termux IP Tracker (Full, scary UI, sound)
+Made to run on Termux (Android). English UI. Final credit in Korean.
+Author tag: Tae-yang (printed at the end)
+"""
+
+import os
+import sys
+import time
+import socket
+import json
+import math
+import wave
+import struct
+import shutil
+import subprocess
+from typing import Optional, Dict, Any
+
+try:
+    import requests
+except Exception:
+    print("Missing dependency 'requests'. Run: pip install requests")
+    sys.exit(1)
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich import box
+    from rich.align import Align
+    from rich.text import Text
+except Exception:
+    print("Missing dependency 'rich'. Run: pip install rich")
+    sys.exit(1)
+
+# optional for big banner
+USE_PYFIGLET = False
+try:
+    import pyfiglet
+    USE_PYFIGLET = True
+except Exception:
+    USE_PYFIGLET = False
+
+console = Console()
+
+TIMEOUT = 10
+TMP_WAV = "/data/data/com.termux/files/home/.ipx_scream.wav" \
+    if os.path.isdir("/data/data/com.termux") else "/tmp/.ipx_scream.wav"
+
+# --------- helpers ----------
+def cls():
+    os.system("clear" if os.name != "nt" else "cls")
+
+def check_cmd(cmd: str) -> Optional[str]:
+    """Return path to command if available."""
+    return shutil.which(cmd)
+
+def write_scary_wav(path: str, duration: float = 2.6, sample_rate: int = 44100):
+    """Generate a short 'scary sweep' WAV file programmatically."""
+    # sweep from low to high frequency with amplitude modulation
+    framerate = sample_rate
+    nframes = int(duration * framerate)
+    max_amp = 32767
+    with wave.open(path, 'w') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(framerate)
+        for i in range(nframes):
+            t = i / framerate
+            # frequency sweep: 150Hz -> 1400Hz (exponential-ish)
+            f = 150 * (1.02 ** (i / 20.0))
+            # add a little noise and amplitude envelope
+            envelope = (1.0 - (t / duration)) ** 2
+            # make it a bit more creepy by adding sub-harmonics
+            sample = 0.5 * math.sin(2 * math.pi * f * t) \
+                     + 0.35 * math.sin(2 * math.pi * (f*0.5) * t) \
+                     + 0.1 * (0.5 - math.sin(2 * math.pi * 3.3 * t) * 0.5)
+            val = int(max_amp * envelope * sample * 0.9)
+            data = struct.pack('<h', max(-max_amp, min(max_amp, val)))
+            wf.writeframesraw(data)
+    # ensure file exists
+    return os.path.exists(path)
+
+def play_sound(path: str):
+    """
+    Try to play sound using common Termux-friendly players:
+    1) termux-media-player play <file>
+    2) mpv <file> --no-video
+    3) ffplay -nodisp -autoexit
+    4) aplay <file>
+    5) play (sox)
+    fallback: print bell chars
+    """
+    players = [
+        ("termux-media-player", ["termux-media-player", "play", path]),
+        ("mpv", ["mpv", "--no-video", path]),
+        ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]),
+        ("aplay", ["aplay", path]),
+        ("play", ["play", "-q", path]),
+    ]
+    for name, cmd in players:
+        if check_cmd(cmd[0]):
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                continue
+    # fallback: bells
+    sys.stdout.write("\a\a\a")
+    sys.stdout.flush()
+    return False
+
+def typewriter(text: str, delay: float = 0.01, end="\n"):
+    for ch in text:
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+        time.sleep(delay)
+    sys.stdout.write(end)
+    sys.stdout.flush()
+
+def resolve_host(target: str) -> str:
+    # try direct IP
+    try:
+        socket.inet_aton(target)
+        return target
+    except Exception:
+        pass
+    # try getaddrinfo
+    try:
+        info = socket.getaddrinfo(target, None)
+        if info:
+            return info[0][4][0]
+    except Exception:
+        pass
+    # fallback
+    try:
+        return socket.gethostbyname(target)
+    except Exception as e:
+        raise ValueError(f"Could not resolve target '{target}': {e}")
+
+def reverse_dns(ip: str) -> Optional[str]:
+    try:
+        name, _, _ = socket.gethostbyaddr(ip)
+        return name
+    except Exception:
+        return None
+
+def fetch_ipwhois(ip: str) -> Optional[Dict[str, Any]]:
+    try:
+        r = requests.get(f"https://ipwho.is/{ip}", timeout=TIMEOUT)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("success") is True:
+                return d
+    except Exception:
+        return None
+    return None
+
+def fetch_ipapi(ip: str) -> Optional[Dict[str, Any]]:
+    try:
+        r = requests.get(f"http://ip-api.com/json/{ip}", timeout=TIMEOUT)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("status") == "success":
+                return d
+    except Exception:
+        return None
+    return None
+
+def is_private_ip(ip: str) -> bool:
+    # simple IPv4 checks
+    try:
+        parts = [int(x) for x in ip.split(".")]
+        a, b = parts[0], parts[1]
+        if a == 10: return True
+        if a == 127: return True
+        if a == 192 and b == 168: return True
+        if a == 172 and 16 <= b <= 31: return True
+    except Exception:
+        pass
+    return False
+
+# --------- UI pieces ----------
+BIG_STATIC = r"""
+██████╗ ██╗██████╗  ██████╗ 
+██╔══██╗██║██╔══██╗██╔═══██╗
+██████╔╝██║██████╔╝██║   ██║
+██╔═══╝ ██║██╔══██╗██║   ██║
+██║     ██║██████╔╝╚██████╔╝
+╚═╝     ╚═╝╚═════╝  ╚═════╝ 
+   ███████  ██████  ██ 
+"""
+
+def show_banner():
+    cls()
+    if USE_PYFIGLET:
+        try:
+            fig = pyfiglet.figlet_format("IPX TRACKER", font="slant")
+            console.print(Panel.fit(f"[red]{fig}[/red]\n", border_style="bright_red"))
+        except Exception:
+            console.print(Panel.fit(BIG_STATIC, border_style="red"))
+    else:
+        console.print(Panel.fit(BIG_STATIC, border_style="red"))
+
+def startup_sequence():
+    cls()
+    show_banner()
+    # message
+    console.print(Panel.fit("[bold red]⚠ FOR ETHICAL & EDUCATIONAL USE ONLY ⚠\nDo not use this tool for harassment or illegal tracking.[/bold red]",
+                            subtitle="IPX - Keep it lawful", border_style="yellow"))
+    # write the scary wav
+    try:
+        write_scary_wav(TMP_WAV)
+        play_sound(TMP_WAV)
+    except Exception:
+        # best effort
+        sys.stdout.write("\a"); sys.stdout.flush()
+    # loading animation with typewriter messages
+    messages = [
+        "Initializing IPX engine...",
+        "Bootstrapping OSINT modules...",
+        "Locking spectre routines...",
+        "Warming sensors...",
+        "Ready."
+    ]
+    for msg in messages:
+        typewriter(msg, delay=0.02)
+        time.sleep(0.25)
+    time.sleep(0.6)
+    cls()
+
+def main_menu() -> str:
+    console.print(Panel.fit("[1] PUBLIC IP   [2] PRIVATE IP   [3] JUST TRACK   [q] Quit",
+                            title="[bold red]IPX MENU[/bold red]", border_style="red"))
+    choice = console.input("[bold white]Choose (1/2/3/q): [/bold white]")
+    return choice.strip().lower()
+
+def pretty_table_from_data(ip: str, primary: Dict[str, Any], fallback: Optional[Dict[str, Any]], ptr: Optional[str]):
+    table = Table(title=f"IPX — {ip}", box=box.DOUBLE_EDGE, show_lines=False)
+    table.add_column("Field", style="bold cyan", width=26)
+    table.add_column("Value", style="white")
+
+    def add(k,v):
+        if v is None or v == "":
+            v = "-"
+        table.add_row(k, str(v))
+
+    add("DROP IP", ip)
+    add("Reverse DNS", ptr or "-")
+    add("CITY", primary.get("city") or (fallback or {}).get("city"))
+    add("COUNTRY", primary.get("country") or (fallback or {}).get("country"))
+    add("THE CONTINENT", primary.get("continent") or (fallback or {}).get("continent") or "-")
+    add("ISP", (primary.get("connection") or {}).get("isp") or (fallback or {}).get("isp"))
+    add("DNS", ptr or socket.getfqdn(ip))
+    # IP RANGE: try to provide 5 similar-ish placeholders or from asn/org
+    ip_range_list = []
+    org = primary.get("org") or (fallback or {}).get("org")
+    if org:
+        for i in range(5):
+            ip_range_list.append(f"{org}-range-{i+1}")
+    else:
+        for i in range(5):
+            ip_range_list.append("**********")
+    add("IP RANGE", "\n".join([f"{i+1} - {r}" for i,r in enumerate(ip_range_list)]))
+    add("What TYPE OF IP (Private/Public)?", "Private" if is_private_ip(ip) else "Public")
+    lat = primary.get("latitude") or (fallback or {}).get("lat")
+    lon = primary.get("longitude") or (fallback or {}).get("lon")
+    add("GOOGLE MAPS", f"https://maps.google.com/?q={lat},{lon}" if lat and lon else "-")
+    add("GEO-TARGETING", primary.get("timezone") or (fallback or {}).get("timezone") or "-")
+    add("LATITUDE", lat)
+    add("LONGITUDE", lon)
+    add("TIME ZONE", primary.get("timezone") or (fallback or {}).get("timezone"))
+    add("CCODE - COUNTRY CODE", primary.get("country_code") or (fallback or {}).get("countryCode"))
+    add("ORG", org or "-")
+    add("GNP", (primary.get("currency") or {}).get("name") or "-")
+
+    return table
+
+# --------- flows ----------
+def flow_public_ip():
+    cls()
+    target = console.input("[bold white]Enter PUBLIC IP or Hostname (or 'me'): [/bold white]").strip()
+    if not target:
+        console.print("[red]No input.[/red]"); time.sleep(0.7); return
+    if target.lower() == "me":
+        try:
+            target = requests.get("https://api.ipify.org", timeout=TIMEOUT).text.strip()
+        except Exception:
+            console.print("[red]Could not determine public IP (no network).[/red]"); time.sleep(0.7); return
+    try:
+        ip = resolve_host(target)
+    except Exception as e:
+        console.print(f"[red]Resolve error:[/red] {e}"); time.sleep(0.7); return
+
+    # nice transition
+    typewriter("DROP IP : " + ip, delay=0.02)
+    # fetch primary and fallback
+    primary = fetch_ipwhois(ip)
+    fallback = None
+    if not primary:
+        fallback = fetch_ipapi(ip)
+        if not fallback:
+            console.print("[yellow]No external geolocation available.[/yellow]")
+            primary = {}
+        else:
+            # normalize fallback roughly
+            primary = {
+                "ip": ip,
+                "city": fallback.get("city"),
+                "country": fallback.get("country"),
+                "continent": fallback.get("continent"),
+                "country_code": fallback.get("countryCode"),
+                "latitude": fallback.get("lat"),
+                "longitude": fallback.get("lon"),
+                "timezone": fallback.get("timezone"),
+                "org": fallback.get("org"),
+                "connection": {"isp": fallback.get("isp")}
+            }
+    ptr = reverse_dns(ip)
+    cls()
+    console.print(pretty_table_from_data(ip, primary, fallback, ptr))
+    console.print(Panel.fit("[bold yellow]End of PUBLIC IP report — Use ethically.[/bold yellow]"))
+    console.input("\nPress Enter to return to menu...")
+
+def flow_private_ip():
+    cls()
+    ip = console.input("[bold white]Enter PRIVATE IP (e.g. 192.168.1.10): [/bold white]").strip()
+    if not ip:
+        console.print("[red]No input.[/red]"); time.sleep(0.7); return
+    ptr = reverse_dns(ip) or "-"
+    # fabricate a private data structure for display
+    primary = {
+        "ip": ip, "city": "-", "country": "-", "continent": "-", "country_code": "-", "latitude": "-", "longitude": "-",
+        "timezone": "-", "org": "-", "connection": {"isp": "-"}, "currency": {"name": "-"}
+    }
+    cls()
+    console.print(pretty_table_from_data(ip, primary, None, ptr))
+    console.print(Panel.fit("[bold yellow]This is a private/local address — external geolocation not attempted.[/bold yellow]"))
+    console.input("\nPress Enter to return to menu...")
+
+def flow_just_track():
+    cls()
+    target = console.input("[bold white]Enter IP or hostname to QUICK-TRACK: [/bold white]").strip()
+    if not target:
+        console.print("[red]No input.[/red]"); time.sleep(0.7); return
+    try:
+        ip = resolve_host(target)
+    except Exception as e:
+        console.print(f"[red]Resolve error:[/red] {e}"); time.sleep(0.7); return
+    ptr = reverse_dns(ip)
+    pvt = is_private_ip(ip)
+    cls()
+    console.print(Panel.fit(f"IP: {ip}\nType: {'Private' if pvt else 'Public'}\nReverse DNS: {ptr or '-'}", title="[bold red]JUST TRACK[/bold red]"))
+    if not pvt:
+        primary = fetch_ipwhois(ip)
+        fallback = None
+        if not primary:
+            fallback = fetch_ipapi(ip)
+            if not fallback:
+                console.print("[yellow]No external data available.[/yellow]")
+                console.input("\nPress Enter to return to menu...")
+                return
+            primary = {
+                "ip": ip,
+                "city": fallback.get("city"),
+                "country": fallback.get("country"),
+                "latitude": fallback.get("lat"),
+                "longitude": fallback.get("lon"),
+                "timezone": fallback.get("timezone"),
+                "org": fallback.get("org"),
+                "connection": {"isp": fallback.get("isp")}
+            }
+        console.print(pretty_table_from_data(ip, primary, fallback, ptr))
+    console.input("\nPress Enter to return to menu...")
+
+# --------- main ----------
+def main():
+    startup_sequence()
+    while True:
+        cls()
+        show_banner()
+        choice = main_menu()
+        if choice in ("q", "quit", "exit"):
+            cls()
+            console.print(Panel.fit("[bold magenta]Exiting IPX. Stay ethical.[/bold magenta]"))
+            break
+        elif choice == "1":
+            flow_public_ip()
+        elif choice == "2":
+            flow_private_ip()
+        elif choice == "3":
+            flow_just_track()
+        else:
+            console.print("[red]Invalid choice.[/red]")
+            time.sleep(0.6)
+
+    # final credit (Korean) — as requested
+    console.print("\n")
+    console.print(Align.center(Text("제작: 태양 (Tae-yang)", style="bold white on black")))
+    # cleanup temp wav if exists
+    try:
+        if os.path.exists(TMP_WAV):
+            os.remove(TMP_WAV)
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[red]Interrupted.[/red]")
+        sys.exit(0)
